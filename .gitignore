@@ -1,0 +1,3 @@
+vast_ai/
+local_tagger_model/*.onnx
+local_tagger_model/*.csv
