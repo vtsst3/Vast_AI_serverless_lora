@@ -1,3 +1,11 @@
+# --- [PATH FIX] ---
+# このスクリプトがどこから実行されても、プロジェクトのルートディレクトリをPythonの検索パスに追加する
+import sys
+import os
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+# --- [END PATH FIX] ---
 import os
 import subprocess
 import requests
