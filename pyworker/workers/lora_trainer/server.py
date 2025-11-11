@@ -1,11 +1,3 @@
-# --- [PATH FIX] ---
-# このスクリプトがどこから実行されても、プロジェクトのルートディレクトリをPythonの検索パスに追加する
-import sys
-import os
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
-# --- [END PATH FIX] ---
 import os
 import subprocess
 import requests
@@ -16,86 +8,89 @@ import glob
 import time
 import dataclasses
 import logging
-from typing import Dict, Any, Union, Type
-from aiohttp import web, ClientResponse
-
-from lib.backend import Backend, LogAction
-from lib.data_types import EndpointHandler
-from lib.server import start_server
-from .data_types import InputData
+from typing import Dict, Any, Optional
+from aiohttp import web
+import json
+import asyncio
 
 # --- ロガーの設定 ---
-logging.basicConfig(level=logging.DEBUG, format="%(asctime)s[%(levelname)-5s] %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)-5s] %(message)s")
 log = logging.getLogger(__name__)
+
+# --- データクラスの定義 ---
+@dataclasses.dataclass
+class InputData:
+    job_id: str
+    user_id: str
+    image_r2_key: str
+    webhook_url: Optional[str] = None
 
 # --- グローバル設定 ---
 BASE_MODEL_PATH = os.environ.get('BASE_MODEL_PATH', '/workspace/modelse/checkpointse/Illustriouse/solventeclipseVpred_v11.safetensors')
 R2_ENDPOINT_URL = os.environ.get('R2_ENDPOINT_URL')
 S3_BUCKET_NAME = os.environ.get('S3_BUCKET_NAME')
+s3_client = None
 
-# boto3クライアントは一度だけ初期化
-s3_client = boto3.client(
-    's3',
-    endpoint_url=R2_ENDPOINT_URL,
-    aws_access_key_id=os.environ.get('AWS_ACCESS_KEY_ID'),
-    aws_secret_access_key=os.environ.get('AWS_SECRET_ACCESS_KEY')
-)
+def initialize_s3_client():
+    global s3_client
+    access_key = os.environ.get('AWS_ACCESS_KEY_ID')
+    secret_key = os.environ.get('AWS_SECRET_ACCESS_KEY')
+    if not all([R2_ENDPOINT_URL, S3_BUCKET_NAME, access_key, secret_key]):
+        log.warning("S3/R2 environment variables are not fully set. S3 operations will be skipped.")
+        s3_client = None
+        return
+    s3_client = boto3.client('s3', endpoint_url=R2_ENDPOINT_URL, aws_access_key_id=access_key, aws_secret_access_key=secret_key)
+    log.info("S3/R2 client initialized successfully.")
 
-# --- vast_runner.pyから移植した学習関数群 ---
+# --- 学習関数群 ---
+def run_command(command: list, cwd: str):
+    log.info(f"Running command: {' '.join(command)} in {cwd}")
+    process = subprocess.Popen(command, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace')
+    for line in iter(process.stdout.readline, ''):
+        log.info(line.strip())
+    process.stdout.close()
+    return_code = process.wait()
+    if return_code:
+        raise subprocess.CalledProcessError(return_code, command)
 
 def run_tagger(train_data_dir: str) -> str:
     log.info("--- Starting Tagger ---")
-    model_dir = "/workspace/local_tagger_model"
     command = [
         "accelerate", "launch", "./sd-scripts/finetune/tag_images_by_wd14_tagger.py",
-        train_data_dir, "--model_dir", model_dir, "--batch_size", "1",
-        "--caption_extension", ".txt", "--general_threshold", "0.35",
-        "--character_threshold", "0.85", "--onnx",
+        train_data_dir, "--model_dir=/workspace/local_tagger_model", "--batch_size=1",
+        "--caption_extension=.txt", "--general_threshold=0.35", "--character_threshold=0.85", "--onnx",
     ]
-    log.info(f"Tagger Command: {' '.join(command)}")
-    subprocess.run(command, check=True)
+    run_command(command, cwd="/workspace/lora-worker")
     log.info("--- Tagger Finished ---")
     caption_files = glob.glob(os.path.join(train_data_dir, "*.txt"))
-    if caption_files:
-        with open(caption_files[0], 'r') as f:
-            return f.read()
-    return ""
+    return open(caption_files[0], 'r', encoding='utf-8').read() if caption_files else ""
 
 def run_training(job_id: str, train_data_dir: str) -> str:
     output_dir = f"/workspace/output/{job_id}"
     os.makedirs(output_dir, exist_ok=True)
     command = [
         "accelerate", "launch", "./sd-scripts/sdxl_train_network.py",
-        "--pretrained_model_name_or_path", BASE_MODEL_PATH,
-        "--train_data_dir", train_data_dir,
-        "--output_dir", output_dir,
-        "--output_name", f"{job_id}_lora",
-        "--resolution", "1024,1024", "--train_batch_size", "1",
-        "--max_train_epochs", "10", "--dataset_repeats", "30",
-        "--save_every_n_epochs", "2", "--learning_rate", "1.0",
-        "--unet_lr", "1.0", "--text_encoder_lr", "1.0",
-        "--network_module", "networks.lora", "--network_dim", "64",
-        "--network_alpha", "32", "--optimizer_type", "Prodigy",
+        "--pretrained_model_name_or_path", BASE_MODEL_PATH, "--train_data_dir", train_data_dir,
+        "--output_dir", output_dir, "--output_name", f"{job_id}_lora",
+        "--resolution=1024,1024", "--train_batch_size=1", "--max_train_epochs=10",
+        "--dataset_repeats=30", "--save_every_n_epochs=2", "--learning_rate=1.0",
+        "--unet_lr=1.0", "--text_encoder_lr=1.0", "--network_module=networks.lora",
+        "--network_dim=64", "--network_alpha=32", "--optimizer_type=Prodigy",
         '--optimizer_args', 'decouple=True', 'weight_decay=0.01', 'use_bias_correction=True', 'd_coef=0.8', 'd0=5e-5', 'safeguard_warmup=True', 'betas=0.9,0.99',
-        "--lr_scheduler", "cosine", "--mixed_precision", "bf16",
-        "--save_precision", "bf16", "--gradient_checkpointing",
-        "--xformers", "--no_half_vae", "--v_parameterization",
-        "--min_snr_gamma", "5", "--save_model_as", "safetensors",
-        "--caption_extension", ".txt", "--cache_latents", "--cache_latents_to_disk"
+        "--lr_scheduler=cosine", "--mixed_precision=bf16", "--save_precision=bf16",
+        "--gradient_checkpointing", "--xformers", "--no_half_vae", "--v_parameterization",
+        "--min_snr_gamma=5", "--save_model_as=safetensors", "--caption_extension=.txt",
+        "--cache_latents", "--cache_latents_to_disk"
     ]
-    log.info(f"--- Starting LoRA Training ---\nCommand: {' '.join(command)}")
-    subprocess.run(command, check=True)
+    run_command(command, cwd="/workspace/lora-worker")
     log.info("--- LoRA Training Finished ---")
     lora_files = glob.glob(os.path.join(output_dir, "*.safetensors"))
-    if not lora_files:
-        raise FileNotFoundError("No LoRA file was generated.")
+    if not lora_files: raise FileNotFoundError("No LoRA file was generated.")
     return max(lora_files, key=os.path.getctime)
 
 def generate_sample_image(lora_path: str, prompt: str, job_id: str) -> str:
     log.info("--- Loading pipeline for sample generation ---")
-    pipeline = DiffusionPipeline.from_pretrained(
-        BASE_MODEL_PATH, torch_dtype=torch.float16, custom_pipeline="lpw_stable_diffusion_xl"
-    )
+    pipeline = DiffusionPipeline.from_pretrained(BASE_MODEL_PATH, torch_dtype=torch.bfloat16, custom_pipeline="lpw_stable_diffusion_xl")
     pipeline.to("cuda")
     log.info(f"--- Loading LoRA weights from {lora_path} ---")
     pipeline.load_lora_weights(lora_path)
@@ -116,111 +111,77 @@ def notify_backend(webhook_url: Optional[str], payload: Dict[str, Any]):
     except requests.RequestException as e:
         log.error(f"Failed to send webhook: {e}")
 
-# --- PyWorker Endpoint Handler ---
-
-@dataclasses.dataclass
-class TrainLoraHandler(EndpointHandler[InputData]):
-
-    @property
-    def endpoint(self) -> str:
-        return "/train-lora"
-
-    @classmethod
-    def payload_cls(cls) -> Type[InputData]:
-        return InputData
-
-    def generate_payload_json(self, payload: InputData) -> Dict[str, Any]:
-        # このワーカーは他のモデルAPIを呼ばないので、実装は不要
-        return {}
-
-    def make_benchmark_payload(self) -> InputData:
-        # ベンチマークはLoRA学習では行わないため、ダミーを返す
-        return InputData.for_test()
-
-    async def handle_request(self, payload: InputData) -> web.Response:
-        """APIリクエストを受け取り、LoRA学習プロセス全体を実行する"""
-        job_id = payload.job_id
-        user_id = payload.user_id
-        image_r2_key = payload.image_r2_key
-        webhook_url = payload.webhook_url
+def run_lora_training_process(payload: InputData):
+    job_id = payload.job_id
+    try:
+        log.info(f"--- Starting LoRA Training Job --- \nJobID: {job_id}")
+        local_image_path = f"/workspace/{os.path.basename(payload.image_r2_key)}"
         
-        log.info(f"--- Received LoRA Training Job --- \nJobID: {job_id}, UserID: {user_id}, ImageKey: {image_r2_key}")
+        if s3_client:
+            log.info(f"Downloading {payload.image_r2_key} from R2...")
+            s3_client.download_file(S3_BUCKET_NAME, payload.image_r2_key, local_image_path)
+        else:
+            raise RuntimeError("S3 client is not initialized. Cannot download image.")
 
-        local_image_path = f"/workspace/{os.path.basename(image_r2_key)}"
-        
-        try:
-            # 1. R2から画像をダウンロード
-            log.info(f"Downloading {image_r2_key} from R2 bucket {S3_BUCKET_NAME}...")
-            s3_client.download_file(S3_BUCKET_NAME, image_r2_key, local_image_path)
+        train_image_dir = f"/workspace/train_data/{job_id}/30_mychar"
+        os.makedirs(train_image_dir, exist_ok=True)
+        os.rename(local_image_path, os.path.join(train_image_dir, "image.jpg"))
 
-            # 2. ディレクトリ構造を準備
-            train_image_dir = f"/workspace/train_data/{job_id}/30_mychar"
-            os.makedirs(train_image_dir, exist_ok=True)
-            os.rename(local_image_path, os.path.join(train_image_dir, "image.jpg"))
+        caption = run_tagger(train_image_dir)
+        log.info(f"Generated Caption: '{caption}'")
 
-            # 3. Taggerでキャプション生成
-            caption = run_tagger(train_image_dir)
-            log.info(f"Generated Caption: '{caption}'")
+        lora_file_path = run_training(job_id, f"/workspace/train_data/{job_id}")
 
-            # 4. LoRA学習実行
-            lora_file_path = run_training(job_id, f"/workspace/train_data/{job_id}")
-
-            # 5. LoRAをR2にアップロード
-            lora_s3_key = f"users/{user_id}/artifacts/{job_id}/lora.safetensors"
+        lora_s3_key = f"users/{payload.user_id}/artifacts/{job_id}/lora.safetensors"
+        if s3_client:
             log.info(f"Uploading LoRA to r2://{S3_BUCKET_NAME}/{lora_s3_key}")
             s3_client.upload_file(lora_file_path, S3_BUCKET_NAME, lora_s3_key)
 
-            # 6. サンプル画像生成
-            sample_prompt = f"masterpiece, best quality, 1girl, {caption}"
-            sample_image_path = generate_sample_image(lora_file_path, sample_prompt, job_id)
+        sample_prompt = f"masterpiece, best quality, 1girl, {caption}"
+        sample_image_path = generate_sample_image(lora_file_path, sample_prompt, job_id)
 
-            # 7. サンプル画像をR2にアップロード
-            sample_image_s3_key = f"users/{user_id}/artifacts/{job_id}/sample.png"
+        sample_image_s3_key = f"users/{payload.user_id}/artifacts/{job_id}/sample.png"
+        if s3_client:
             log.info(f"Uploading sample image to r2://{S3_BUCKET_NAME}/{sample_image_s3_key}")
             s3_client.upload_file(sample_image_path, S3_BUCKET_NAME, sample_image_s3_key)
 
-            # 8. 成功を通知 & レスポンス
-            completion_payload = {
-                "job_id": job_id, "status": "COMPLETED",
-                "artifacts": {
-                    "lora_url": f"r2://{S3_BUCKET_NAME}/{lora_s3_key}",
-                    "sample_image_url": f"r2://{S3_BUCKET_NAME}/{sample_image_s3_key}"
-                }
-            }
-            notify_backend(webhook_url, completion_payload)
-            return web.json_response(completion_payload, status=200)
+        completion_payload = {
+            "job_id": job_id, "status": "COMPLETED",
+            "artifacts": {"lora_url": f"r2://{S3_BUCKET_NAME}/{lora_s3_key}", "sample_image_url": f"r2://{S3_BUCKET_NAME}/{sample_image_s3_key}"}
+        }
+        notify_backend(payload.webhook_url, completion_payload)
+        log.info(f"Job {job_id} completed successfully.")
+    except Exception as e:
+        log.exception(f"An error occurred during LoRA training job {job_id}: {e}")
+        error_payload = {"job_id": job_id, "status": "FAILED", "error": str(e)}
+        notify_backend(payload.webhook_url, error_payload)
 
-        except Exception as e:
-            log.exception(f"An error occurred during LoRA training job {job_id}: {e}")
-            error_payload = {"job_id": job_id, "status": "FAILED", "error": str(e)}
-            notify_backend(webhook_url, error_payload)
-            return web.json_response(error_payload, status=500)
+async def handle_train_lora(request: web.Request) -> web.Response:
+    try:
+        data = await request.json()
+        payload = InputData(**data)
+    except (json.JSONDecodeError, TypeError) as e:
+        log.error(f"Invalid JSON payload: {e}")
+        return web.json_response({"status": "FAILED", "error": f"Invalid JSON payload: {e}"}, status=400)
 
-    async def generate_client_response(self, client_request: web.Request, model_response: ClientResponse) -> Union[web.Response, web.StreamResponse]:
-        # このハンドラは内部で完結するため、モデルサーバへのリクエスト(model_response)は発生しない。
-        # handle_requestを直接呼び出すように`Backend`を少し改造する必要があるかもしれないが、
-        # ここではPyWorkerの標準的な形式に合わせ、このメソッドは空にしておく。
-        # 実際には、`backend.create_handler`が`handle_request`を呼び出す。
-        pass
+    log.info(f"Accepted job {payload.job_id}. Starting training process in background.")
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(None, run_lora_training_process, payload)
+    return web.json_response({"status": "ACCEPTED", "job_id": payload.job_id}, status=202)
 
-# --- サーバーの起動設定 ---
-
-# このPyWorkerは他のモデルサーバーをラップするのではなく、自身が処理を実行する。
-# そのため、`Backend`クラスのいくつかのパラメータは不要。
-backend = Backend(
-    # model_server_urlは使わないが、形式上必要
-    model_server_url="", 
-    # このワーカーは一度に一つの学習ジョブしか実行できない
-    allow_parallel_requests=False,
-    # ベンチマークは実行しない
-    benchmark_handler=None,
-)
-
-# ルーティング設定
-routes = [
-    web.post("/train-lora", backend.create_handler(TrainLoraHandler())),
-]
+async def main():
+    initialize_s3_client()
+    app = web.Application()
+    app.add_routes([web.post('/train-lora', handle_train_lora)])
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', 8000)
+    log.info("======== LoRA Worker Server starting on 0.0.0.0:8000 ========")
+    await site.start()
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    # PyWorkerサーバーを起動
-    start_server(backend, routes)
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        log.info("Server shutting down.")
